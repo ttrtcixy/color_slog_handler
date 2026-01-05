@@ -135,7 +135,7 @@ func (h *ColorizedHandler) Handle(_ context.Context, record slog.Record) error {
 	h.mu.Unlock()
 
 	// Return buffer to pool only if it hasn't grown too large.
-	// This prevents one huge log message from permanently keeping a large chunk of memory.
+	// This prevents one huge Handler message from permanently keeping a large chunk of memory.
 	if cap(buf) <= maxPoolBufSize {
 		*pBuf = buf
 		bufPool.Put(pBuf)

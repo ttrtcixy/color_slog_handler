@@ -7,16 +7,16 @@ import (
 )
 
 type Logger struct {
-	log slog.Handler
+	Handler slog.Handler
 }
 
 func NewLogger(h slog.Handler) *Logger {
 	return &Logger{
-		log: h,
+		Handler: h,
 	}
 }
 func (l *Logger) logAttrs(ctx context.Context, level slog.Level, msg string, attrs ...slog.Attr) {
-	if !l.log.Enabled(ctx, level) {
+	if !l.Handler.Enabled(ctx, level) {
 		return
 	}
 
@@ -24,7 +24,7 @@ func (l *Logger) logAttrs(ctx context.Context, level slog.Level, msg string, att
 
 	record := slog.NewRecord(time.Now(), level, msg, pc)
 	record.AddAttrs(attrs...)
-	_ = l.log.Handle(ctx, record)
+	_ = l.Handler.Handle(ctx, record)
 }
 
 func (l *Logger) Info(msg string, attrs ...slog.Attr) {
@@ -95,7 +95,7 @@ func (l *Logger) With(attrs ...slog.Attr) *Logger {
 	if len(attrs) == 0 {
 		return l
 	}
-	return &Logger{log: l.log.WithAttrs(attrs)}
+	return &Logger{Handler: l.Handler.WithAttrs(attrs)}
 }
 
 func (l *Logger) WithGroup(name string) *Logger {
@@ -103,9 +103,9 @@ func (l *Logger) WithGroup(name string) *Logger {
 		return l
 	}
 
-	return &Logger{log: l.log.WithGroup(name)}
+	return &Logger{Handler: l.Handler.WithGroup(name)}
 }
 
 func (l *Logger) Enabled(ctx context.Context, level slog.Level) bool {
-	return l.log.Enabled(ctx, level)
+	return l.Handler.Enabled(ctx, level)
 }
