@@ -1,8 +1,8 @@
 package logger
 
 import (
-	"io"
 	"log/slog"
+	"os"
 	"testing"
 	"time"
 )
@@ -18,13 +18,13 @@ var (
 )
 
 func BenchmarkLoggerSlogColorHandler(b *testing.B) {
-	logger := NewLogger(NewTextHandler(io.Discard, Config{Level: LevelDebug}))
+	logger := NewLogger(NewTextHandler(os.Stdout, Config{Level: LevelDebug}))
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			//logger := logger.WithGroup("test_g")
-			//logger = logger.With(String("qwe", "tte"))
+			logger := logger.WithGroup("test_g")
+			logger = logger.With(String("qwe", "tte"))
 
 			logger.Info(nil, "msg",
 				String("user_id", "user_99"),
@@ -39,12 +39,12 @@ func BenchmarkLoggerSlogColorHandler(b *testing.B) {
 }
 
 func BenchmarkLoggerSlog(b *testing.B) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			//logger := logger.WithGroup("test_g")
-			//logger = logger.With(slog.String("qwe", "tte"))
+			logger := logger.WithGroup("test_g")
+			logger = logger.With(slog.String("qwe", "tte"))
 
 			logger.LogAttrs(nil, slog.LevelInfo, "msg",
 				slog.String("user_id", "user_99"),
