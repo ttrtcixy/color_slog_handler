@@ -3,16 +3,24 @@ package logger
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	writerBufSize      = 4096
-	maxPoolBufSize     = 2048
+	// size of buffio.Writer
+	writerBufSize = 4096
+	// max size of pool buffer
+	maxPoolBufSize = 2048
+	// base size when creating a buffer for the pool
 	basePoolBufferSize = 512
+	// waiting time for the automatic Flush() call
+	flushTime = time.Millisecond * 250
 )
 
 var (
@@ -26,7 +34,7 @@ var (
 	none    = []byte("")
 )
 
-var (
+const (
 	LevelDebug = "DEBUG"
 	LevelInfo  = "INFO"
 	LevelWarn  = "WARN"
@@ -34,8 +42,6 @@ var (
 )
 
 // bufPool uses a pointer to a slice (*[]byte) to minimize overhead.
-// Putting a raw []byte (header) into an interface{} causes an allocation.
-// Storing a pointer fits better within the interface word size.
 var bufPool = sync.Pool{
 	New: func() any {
 		// Use a pointer to slice to avoid allocation when putting back to pool
@@ -45,7 +51,10 @@ var bufPool = sync.Pool{
 }
 
 type Config struct {
-	Level string `env:"LOG_LEVEL"`
+	// logger level
+	Level int `env:"LOG_LEVEL"`
+	// start buffered output to minimize count of syscall, buff size - 4096
+	BufferedOutput bool `env:"LOG_BUFFERED"`
 }
 
 type colorOptions struct {
@@ -65,64 +74,126 @@ func newColorOptions(timeColor, keyColor, valueColor []byte) *colorOptions {
 type ColorizedHandler struct {
 	colorOpts *colorOptions
 
-	// Use a shared mutex to protect the underlying io.Writer.
-	mu *sync.Mutex
-	w  *bufio.Writer
+	// holds the state common to all clones of the handler (writer, mutex, flags).
+	shared *shared
 
 	level slog.Level
-
 	// groupPrefix stores the accumulated group name (e.g., "http.server.")
 	// to flatten nested groups into dot-notation keys.
 	groupPrefix string
 
 	// precomputed stores already formatted attributes from WithAttrs()
-	// as a raw string to append it directly to the buffer, saving CPU cycles.
 	precomputed string
 }
 
-func NewTextHandler(w io.Writer, cfg Config) *ColorizedHandler {
-	h := &ColorizedHandler{
-		colorOpts: newColorOptions(blue, magenta, none),
-		mu:        &sync.Mutex{},
-		w:         bufio.NewWriterSize(w, writerBufSize),
-		level:     parseLevel(cfg.Level),
+// shared contains resources that must be synchronized across all handler clones.
+type shared struct {
+	// protects the underlying writers (bw and w).
+	mu *sync.Mutex
+
+	// buffered writer (can be nil if buffering is disabled).
+	bw *bufio.Writer
+	// underlying writer.
+	w io.Writer
+
+	// used to signal the flusher goroutine to stop.
+	done chan struct{}
+	// closed indicates whether the handler has been closed.
+	closed atomic.Bool
+}
+
+func NewTextHandler(w io.Writer, cfg *Config) *ColorizedHandler {
+	if w == nil {
+		w = os.Stderr
+	}
+	if cfg == nil {
+		cfg = &Config{Level: 0, BufferedOutput: false}
 	}
 
-	// Start a background routine to periodically flush the buffer.
-	// This ensures logs appear even during low activity periods.
-	go h.flusher()
+	shared := &shared{
+		mu:     &sync.Mutex{},
+		w:      w,
+		done:   make(chan struct{}),
+		closed: atomic.Bool{},
+	}
+
+	h := &ColorizedHandler{
+		colorOpts: newColorOptions(blue, magenta, none),
+		shared:    shared,
+		level:     slog.Level(cfg.Level),
+	}
+
+	if cfg.BufferedOutput {
+		bw := bufio.NewWriterSize(w, writerBufSize)
+		h.shared.bw = bw
+		// Start a background routine to periodically flush the buffer.
+		// This ensures logs appear even during low activity periods.
+		// NOTE: The user MUST call Close() to stop this goroutine and prevent leaks.
+		go h.flusher()
+	}
 
 	return h
 }
 
-// flusher periodically flushes the buffer to the underlying writer.
-// NOTE: This goroutine runs until the application exits.
-// If the handler is meant to be short-lived, a Close() method with a done channel is needed.
-// todo Close()
+// flusher periodically flushes the buffer to the writer.
+// It stops when the done channel is closed.
 func (h *ColorizedHandler) flusher() {
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(flushTime)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		h.mu.Lock()
-		_ = h.w.Flush()
-		h.mu.Unlock()
+	for {
+		select {
+		case <-h.shared.done:
+			return
+		case <-ticker.C:
+			h.flushBuffer()
+		}
 	}
 }
 
-// Sync ensures all buffered logs are written to the output.
-// Should be called before application exit.
-func (h *ColorizedHandler) Sync() error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.w.Flush()
+// flushBuffer writes any buffered data to the underlying writer.
+func (h *ColorizedHandler) flushBuffer() {
+	h.shared.mu.Lock()
+	_ = h.shared.bw.Flush()
+	h.shared.mu.Unlock()
+}
+
+var (
+	ErrNothingToClose = errors.New("use of close() is supported only for buffered logging")
+	ErrAlreadyClosed  = errors.New("logger buffer already closed")
+)
+
+// Close signals the flusher to stop, marks the handler as closed using an atomic flag and flush buffer.
+// Closes buffered output only
+func (h *ColorizedHandler) Close(_ context.Context) error { // todo close write to io.Writer, not only bufio.Writer
+	// If buffering was never create.
+	if h.shared.bw == nil {
+		return ErrNothingToClose
+	}
+
+	// If already closed, do nothing.
+	if h.shared.closed.Swap(true) {
+		return ErrAlreadyClosed
+	}
+
+	// Close the channel to signal the flusher goroutine to exit.
+	close(h.shared.done)
+
+	h.flushBuffer()
+	return nil
 }
 
 func (h *ColorizedHandler) Enabled(_ context.Context, level slog.Level) bool {
+	if h.shared.closed.Load() {
+		return false
+	}
 	return level >= h.level
 }
 
-func (h *ColorizedHandler) Handle(_ context.Context, record slog.Record) error {
+func (h *ColorizedHandler) Handle(_ context.Context, record slog.Record) (err error) {
+	if h.shared.closed.Load() {
+		return nil
+	}
 	// Acquire a buffer from the pool to minimize garbage collection pressure.
 	pBuf := bufPool.Get().(*[]byte)
 	// Reset buffer length but keep capacity.
@@ -130,9 +201,15 @@ func (h *ColorizedHandler) Handle(_ context.Context, record slog.Record) error {
 
 	buf = h.buildLog(buf, record)
 
-	h.mu.Lock()
-	_, err := h.w.Write(buf)
-	h.mu.Unlock()
+	if !h.shared.closed.Load() {
+		h.shared.mu.Lock()
+		if h.shared.bw != nil {
+			_, err = h.shared.bw.Write(buf)
+		} else {
+			_, err = h.shared.w.Write(buf)
+		}
+		h.shared.mu.Unlock()
+	}
 
 	// Return buffer to pool only if it hasn't grown too large.
 	// This prevents one huge handler message from permanently keeping a large chunk of memory.
@@ -144,6 +221,7 @@ func (h *ColorizedHandler) Handle(_ context.Context, record slog.Record) error {
 	return err
 }
 
+// WithGroup  returns a new slog.Handler that adds the passed group to all attrs.
 func (h *ColorizedHandler) WithGroup(name string) slog.Handler {
 	if name == "" {
 		return h
@@ -156,13 +234,14 @@ func (h *ColorizedHandler) WithGroup(name string) slog.Handler {
 	return h2
 }
 
+// WithAttrs returns a new slog.Handler with the given attributes appended.
 func (h *ColorizedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(attrs) == 0 {
 		return h
 	}
 
 	// Temporary buffer for parsing attributes.
-	buf := make([]byte, 0, 512) // todo test for alloc
+	buf := make([]byte, 0, 512)
 
 	// Existing precomputed attributes must come first.
 	buf = append(buf, h.precomputed...)
@@ -186,11 +265,11 @@ func (h *ColorizedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return h2
 }
 
+// clone create new Handler with common state, groupPrefix and precomputed data.
 func (h *ColorizedHandler) clone() *ColorizedHandler {
 	return &ColorizedHandler{
 		colorOpts:   h.colorOpts,
-		mu:          h.mu,
-		w:           h.w,
+		shared:      h.shared,
 		level:       h.level,
 		groupPrefix: h.groupPrefix,
 		precomputed: h.precomputed,
